@@ -1,0 +1,138 @@
+#!/usr/bin/env python
+import os
+import random
+from datasets import load_dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    Trainer,
+    TrainingArguments,
+    DataCollatorForLanguageModeling,
+    TrainerCallback,
+)
+import torch
+
+# ------------------------------------------------------------------------------
+# Custom callback to periodically generate a test output.
+# Every 1000 steps, this callback will use a test sample from the eval set
+# and print the generated transcript for the YouTube title.
+# ------------------------------------------------------------------------------
+class TestOutputCallback(TrainerCallback):
+    def __init__(self, test_sample, tokenizer, generation_kwargs, prompt_template="YouTube Title: {title}\nTranscript:"):
+        self.test_sample = test_sample
+        self.tokenizer = tokenizer
+        self.generation_kwargs = generation_kwargs
+        self.prompt_template = prompt_template
+
+    def on_step_end(self, args, state, control, **kwargs):
+        # Check every 1000 steps (customize this frequency as needed)
+        if state.global_step > 0 and state.global_step % 1000 == 0:
+            model = kwargs["model"]
+            # Build the prompt from the test sample title
+            prompt = self.prompt_template.format(title=self.test_sample["title"])
+            inputs = self.tokenizer(prompt, return_tensors="pt").to(model.device)
+            generated_ids = model.generate(**inputs, **self.generation_kwargs)
+            generated_text = self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+            print(f"\n[Step {state.global_step}] Test Generation for title: {self.test_sample['title']}")
+            print(generated_text)
+        return control
+
+# ------------------------------------------------------------------------------
+# Function to preprocess each example.
+# It creates a prompt that instructs the model to generate the transcript.
+# ------------------------------------------------------------------------------
+def preprocess_function(example, tokenizer, max_length=1024):
+    # Create the prompt from the YouTube title
+    prompt = f"YouTube Title: {example['title']}\nTranscript:"
+    # For training we concatenate the prompt with the transcript.
+    full_text = prompt + " " + example["transcript"]
+    tokenized = tokenizer(full_text, truncation=True, max_length=max_length)
+    return tokenized
+
+# ------------------------------------------------------------------------------
+# Main training function.
+# Loads data, preprocesses it, sets up training arguments (with DeepSpeed for multi-GPU),
+# and starts the training loop with a callback for test generation.
+# ------------------------------------------------------------------------------
+def main():
+    # Path to your CSV dataset (ensure it has a header with "url,title,transcript")
+    data_file = "output.csv"
+
+    # Load the dataset using the Hugging Face datasets library.
+    # Here we load the CSV and split it into train (90%) and eval (10%) sets.
+    raw_dataset = load_dataset("csv", data_files=data_file)
+    split_dataset = raw_dataset["train"].train_test_split(test_size=0.1, seed=42)
+    train_dataset = split_dataset["train"]
+    eval_dataset = split_dataset["test"]
+
+    # Load the tokenizer and the Llama 3.1 70B model.
+    model_name = "meta-llama/Llama-3.1-70B"
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
+    # Ensure the tokenizer has a pad token (set to eos_token if missing)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # For such a large model, we use 8-bit loading (requires bitsandbytes) and
+    # let the Trainer handle device mapping. DeepSpeed will manage multi-GPU training.
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        device_map="auto",
+        load_in_8bit=True,  # reduce memory footprint; ensure bitsandbytes is installed
+    )
+
+    # Preprocess the train and eval datasets.
+    train_dataset = train_dataset.map(lambda x: preprocess_function(x, tokenizer), batched=True)
+    eval_dataset = eval_dataset.map(lambda x: preprocess_function(x, tokenizer), batched=True)
+
+    # Data collator for causal language modeling (no MLM objective)
+    data_collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
+
+    # Set up training arguments.
+    # Adjust the batch sizes, logging, and save frequencies as needed.
+    # The 'deepspeed' argument points to a JSON file with your DeepSpeed configuration.
+    training_args = TrainingArguments(
+        output_dir="./checkpoints",
+        per_device_train_batch_size=1,    # adjust based on GPU memory; gradient accumulation may help
+        per_device_eval_batch_size=1,
+        num_train_epochs=3,
+        logging_steps=100,
+        save_steps=500,
+        evaluation_strategy="steps",
+        eval_steps=500,
+        save_total_limit=3,
+        load_best_model_at_end=True,
+        fp16=True,  # use mixed precision training
+        deepspeed="deepspeed_config.json",  # ensure this file exists and is tuned for your setup
+        report_to="none",  # disable external logging if not needed
+    )
+
+    # Pick a random example from the eval set to periodically test generation.
+    test_sample = random.choice(eval_dataset)
+    generation_kwargs = {
+        "max_new_tokens": 150,
+        "do_sample": True,
+        "temperature": 0.7,
+    }
+
+    # Instantiate the Trainer and add the custom test output callback.
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        data_collator=data_collator,
+        callbacks=[TestOutputCallback(test_sample, tokenizer, generation_kwargs)],
+    )
+
+    # Check if a checkpoint exists in the output directory to resume training.
+    last_checkpoint = None
+    if os.path.isdir(training_args.output_dir) and os.listdir(training_args.output_dir):
+        last_checkpoint = training_args.output_dir
+        print(f"Resuming training from checkpoint: {last_checkpoint}")
+
+    # Start training (this will resume from the checkpoint if found).
+    trainer.train(resume_from_checkpoint=last_checkpoint)
+    trainer.save_model(training_args.output_dir)
+
+if __name__ == "__main__":
+    main()
